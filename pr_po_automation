@@ -17,11 +17,105 @@ df_req['Req #'] = df_req['Req #'].astype(str).str.strip()
 df_order['PO Number (Header)'] = df_order['PO Number (Header)'].astype(str).str.strip()
 
 
-def process_prelim_file(file_path, return_diagnostics=False):
+# ------------------------------------------------
+# One-time lookup precomputation (avoids per-file work)
+# ------------------------------------------------
+def build_lookup_context(df_req: pd.DataFrame, df_order: pd.DataFrame) -> dict:
+    _req = df_req.copy()
+    _req['Req #'] = _req['Req #'].astype(str).str.strip()
+    _req['Req Line #'] = pd.to_numeric(_req['Req Line #'], errors='coerce').astype('Int64') if 'Req Line #' in _req.columns else pd.Series(dtype='Int64')
+    if 'Item' in _req.columns:
+        _req['Item'] = _req['Item'].astype(str).str.strip()
+    _req = _req.dropna(subset=['Req Line #']) if 'Req Line #' in _req.columns else _req
+    if 'Req Line #' in _req.columns:
+        _req['req_key'] = _req['Req #'] + '|' + _req['Req Line #'].astype(str)
+    
+    req_item_map = _req.set_index('req_key')['Item'].to_dict() if 'Item' in _req.columns and 'Req Line #' in _req.columns else {}
+
+    req_status_line_map = _req.set_index('req_key')['Status (Header)'].to_dict() if 'Status (Header)' in _req.columns else {}
+    req_period_line_map = _req.set_index('req_key')['Period'].to_dict() if 'Period' in _req.columns else {}
+    req_total_line_map  = _req.set_index('req_key')['Line Total'].to_dict() if 'Line Total' in _req.columns else {}
+
+    req_first_item_map = (
+        _req.sort_values(['Req #', 'Req Line #'])
+            .groupby('Req #', sort=False)['Item']
+            .first()
+            .to_dict()
+    ) if 'Item' in _req.columns and 'Req Line #' in _req.columns else {}
+
+    req_first_status_map = (
+        _req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Status (Header)'].first().to_dict()
+    ) if 'Status (Header)' in _req.columns and 'Req Line #' in _req.columns else {}
+    req_first_period_map = (
+        _req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Period'].first().to_dict()
+    ) if 'Period' in _req.columns and 'Req Line #' in _req.columns else {}
+    req_first_total_map = (
+        _req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Line Total'].first().to_dict()
+    ) if 'Line Total' in _req.columns and 'Req Line #' in _req.columns else {}
+
+    _order = df_order.copy()
+    _order['PO Number (Header)'] = _order['PO Number (Header)'].astype(str).str.strip()
+    _order['Line'] = pd.to_numeric(_order['Line'], errors='coerce').astype('Int64') if 'Line' in _order.columns else pd.Series(dtype='Int64')
+    if 'Item' in _order.columns:
+        _order['Item'] = _order['Item'].astype(str).str.strip()
+    _order = _order.dropna(subset=['Line']) if 'Line' in _order.columns else _order
+    if 'Line' in _order.columns:
+        _order['order_key'] = _order['PO Number (Header)'] + '|' + _order['Line'].astype(str)
+    
+    order_item_map = _order.set_index('order_key')['Item'].to_dict() if 'Item' in _order.columns and 'Line' in _order.columns else {}
+
+    order_status_line_map = _order.set_index('order_key')['Line Status'].to_dict() if 'Line Status' in _order.columns else {}
+    order_period_line_map = _order.set_index('order_key')['Period'].to_dict() if 'Period' in _order.columns else {}
+    order_total_line_map  = _order.set_index('order_key')['Line Total'].to_dict() if 'Line Total' in _order.columns else {}
+
+    order_first_item_map = (
+        _order.sort_values(['PO Number (Header)', 'Line'])
+              .groupby('PO Number (Header)', sort=False)['Item']
+              .first()
+              .to_dict()
+    ) if 'Item' in _order.columns and 'Line' in _order.columns else {}
+
+    order_first_status_map = (
+        _order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Line Status'].first().to_dict()
+    ) if 'Line Status' in _order.columns and 'Line' in _order.columns else {}
+    order_first_period_map = (
+        _order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Period'].first().to_dict()
+    ) if 'Period' in _order.columns and 'Line' in _order.columns else {}
+    order_first_total_map = (
+        _order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Line Total'].first().to_dict()
+    ) if 'Line Total' in _order.columns and 'Line' in _order.columns else {}
+
+    return {
+        'req_item_map': req_item_map,
+        'order_item_map': order_item_map,
+        'req_first_item_map': req_first_item_map,
+        'order_first_item_map': order_first_item_map,
+        'req_status_line_map': req_status_line_map,
+        'req_period_line_map': req_period_line_map,
+        'req_total_line_map': req_total_line_map,
+        'order_status_line_map': order_status_line_map,
+        'order_period_line_map': order_period_line_map,
+        'order_total_line_map': order_total_line_map,
+        'req_first_status_map': req_first_status_map,
+        'req_first_period_map': req_first_period_map,
+        'req_first_total_map': req_first_total_map,
+        'order_first_status_map': order_first_status_map,
+        'order_first_period_map': order_first_period_map,
+        'order_first_total_map': order_first_total_map,
+    }
+
+
+LOOKUP_CTX = build_lookup_context(df_req, df_order)
+
+
+def process_prelim_file(file_path, lookup_ctx=None, return_diagnostics=False):
     import pandas as pd
     import numpy as np
 
     BASE_COLS = ["PR/PO", "PR/PO Name", "Line Status", "Period", "Line Total"]
+
+    if lookup_ctx is None:
+        lookup_ctx = build_lookup_context(df_req, df_order)
 
     def _ensure_base_cols_exist(df):
         for col in BASE_COLS:
@@ -184,38 +278,12 @@ def process_prelim_file(file_path, return_diagnostics=False):
     )
 
     # =========================
-    # Build lookup dicts (no row doubling)
+    # Lookup dicts (precomputed once)
     # =========================
-    # Layer 1 maps: exact line
-    _req = df_req.copy()
-    _req['Req #']      = _req['Req #'].astype(str).str.strip()
-    _req['Req Line #'] = pd.to_numeric(_req['Req Line #'], errors='coerce').astype('Int64')
-    _req['Item']       = _req['Item'].astype(str).str.strip()
-    _req = _req.dropna(subset=['Req Line #'])
-    _req['req_key']    = _req['Req #'] + '|' + _req['Req Line #'].astype(str)
-    req_item_map = _req.set_index('req_key')['Item'].to_dict()
-
-    _order = df_order.copy()
-    _order['PO Number (Header)'] = _order['PO Number (Header)'].astype(str).str.strip()
-    _order['Line']               = pd.to_numeric(_order['Line'], errors='coerce').astype('Int64')
-    _order['Item']               = _order['Item'].astype(str).str.strip()
-    _order = _order.dropna(subset=['Line'])
-    _order['order_key']          = _order['PO Number (Header)'] + '|' + _order['Line'].astype(str)
-    order_item_map = _order.set_index('order_key')['Item'].to_dict()
-
-    # Layer 2 maps: first Item per PR/PO
-    req_first_item_map = (
-        _req.sort_values(['Req #', 'Req Line #'])
-            .groupby('Req #', sort=False)['Item']
-            .first()
-            .to_dict()
-    )
-    order_first_item_map = (
-        _order.sort_values(['PO Number (Header)', 'Line'])
-              .groupby('PO Number (Header)', sort=False)['Item']
-              .first()
-              .to_dict()
-    )
+    req_item_map = lookup_ctx.get('req_item_map', {})
+    order_item_map = lookup_ctx.get('order_item_map', {})
+    req_first_item_map = lookup_ctx.get('req_first_item_map', {})
+    order_first_item_map = lookup_ctx.get('order_first_item_map', {})
 
     # =========================
     # Fill PR/PO Name (Layer 1 then Layer 2)
@@ -272,22 +340,22 @@ def process_prelim_file(file_path, return_diagnostics=False):
             df_prelim[col] = np.nan
 
     # Line-level maps (Layer 1)
-    req_status_line_map = _req.set_index('req_key')['Status (Header)'].to_dict() if 'Status (Header)' in _req.columns else {}
-    req_period_line_map = _req.set_index('req_key')['Period'].to_dict()             if 'Period' in _req.columns else {}
-    req_total_line_map  = _req.set_index('req_key')['Line Total'].to_dict()         if 'Line Total' in _req.columns else {}
+    req_status_line_map = lookup_ctx.get('req_status_line_map', {})
+    req_period_line_map = lookup_ctx.get('req_period_line_map', {})
+    req_total_line_map  = lookup_ctx.get('req_total_line_map', {})
 
-    order_status_line_map = _order.set_index('order_key')['Line Status'].to_dict()  if 'Line Status' in _order.columns else {}
-    order_period_line_map = _order.set_index('order_key')['Period'].to_dict()       if 'Period' in _order.columns else {}
-    order_total_line_map  = _order.set_index('order_key')['Line Total'].to_dict()   if 'Line Total' in _order.columns else {}
+    order_status_line_map = lookup_ctx.get('order_status_line_map', {})
+    order_period_line_map = lookup_ctx.get('order_period_line_map', {})
+    order_total_line_map  = lookup_ctx.get('order_total_line_map', {})
 
     # First-line-per-PR/PO maps (Layer 2)
-    req_first_status_map = (_req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Status (Header)'].first().to_dict()) if 'Status (Header)' in _req.columns else {}
-    req_first_period_map = (_req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Period'].first().to_dict()) if 'Period' in _req.columns else {}
-    req_first_total_map  = (_req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Line Total'].first().to_dict()) if 'Line Total' in _req.columns else {}
+    req_first_status_map = lookup_ctx.get('req_first_status_map', {})
+    req_first_period_map = lookup_ctx.get('req_first_period_map', {})
+    req_first_total_map  = lookup_ctx.get('req_first_total_map', {})
 
-    order_first_status_map = (_order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Line Status'].first().to_dict()) if 'Line Status' in _order.columns else {}
-    order_first_period_map = (_order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Period'].first().to_dict()) if 'Period' in _order.columns else {}
-    order_first_total_map  = (_order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Line Total'].first().to_dict()) if 'Line Total' in _order.columns else {}
+    order_first_status_map = lookup_ctx.get('order_first_status_map', {})
+    order_first_period_map = lookup_ctx.get('order_first_period_map', {})
+    order_first_total_map  = lookup_ctx.get('order_first_total_map', {})
 
     # Helpers
     def _is_blank(s):
@@ -537,35 +605,27 @@ input_dir = '/content/gdrive/Shareddrives/Gojek FP&A Central Drive/81. Others/au
 output_dir = '/content/gdrive/Shareddrives/Gojek FP&A Central Drive/81. Others/automation/streamlining_region&salestracker/output/'
 consolidated_file_path = os.path.join(output_dir, 'consolidated.xlsx')
 
-# Process and save individual files
+os.makedirs(output_dir, exist_ok=True)
+
+consolidated_sheets = {}
+
+# Process, save individual files, and build consolidated in-memory (avoid re-reading from disk)
 for file_name in os.listdir(input_dir):
     if file_name.upper().endswith('.XLSX'):
         file_path = os.path.join(input_dir, file_name)
-        rns_sheets = process_prelim_file(file_path)
+        rns_sheets = process_prelim_file(file_path, lookup_ctx=LOOKUP_CTX)
         output_file_path = os.path.join(output_dir, f'processed_{file_name.lower()}')
 
         with pd.ExcelWriter(output_file_path, engine='openpyxl') as writer:
             if rns_sheets:
                 for rns_name, df_rns in rns_sheets.items():
                     df_rns.to_excel(writer, sheet_name=rns_name, index=False)
+                    if rns_name in consolidated_sheets:
+                        consolidated_sheets[rns_name] = pd.concat([consolidated_sheets[rns_name], df_rns], ignore_index=True)
+                    else:
+                        consolidated_sheets[rns_name] = df_rns.copy()
             else:
                 pd.DataFrame({'No Data': ['No matching RNS Mapping found']}).to_excel(writer, sheet_name='Empty', index=False)
-
-# Consolidate sheets
-consolidated_sheets = {}
-for file_name in os.listdir(output_dir):
-    if file_name.startswith('processed_') and file_name.endswith('.xlsx'):
-        file_path = os.path.join(output_dir, file_name)
-        xls = pd.ExcelFile(file_path)
-        for sheet_name in xls.sheet_names:
-            if sheet_name != 'Empty':  # Skip empty sheets
-                df = pd.read_excel(xls, sheet_name=sheet_name)
-                # Optional: enforce end-before-mapping order here too
-                # df = _reorder_cols_end_before_mapping(df)
-                if sheet_name in consolidated_sheets:
-                    consolidated_sheets[sheet_name] = pd.concat([consolidated_sheets[sheet_name], df], ignore_index=True)
-                else:
-                    consolidated_sheets[sheet_name] = df
 
 # Save consolidated data
 with pd.ExcelWriter(consolidated_file_path, engine='openpyxl') as writer:
