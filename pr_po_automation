@@ -1,0 +1,575 @@
+import os
+import pandas as pd
+import numpy as np
+
+# ------------------------------------------------------------------
+# Inputs loaded outside the function (assumed already available):
+# - df_ent, df_coa, df_cc, df_cash
+# ------------------------------------------------------------------
+
+# Path to PR/PO lookup files
+lookup_dir = '/content/gdrive/Shareddrives/Gojek FP&A Central Drive/81. Others/automation/streamlining_region&salestracker/input/pr_po'
+df_req = pd.read_excel(os.path.join(lookup_dir, 'requisition_line_list.xlsx'))
+df_order = pd.read_excel(os.path.join(lookup_dir, 'order_line_list.xlsx'))
+
+# Clean lookup keys
+df_req['Req #'] = df_req['Req #'].astype(str).str.strip()
+df_order['PO Number (Header)'] = df_order['PO Number (Header)'].astype(str).str.strip()
+
+
+def process_prelim_file(file_path, return_diagnostics=False):
+    import pandas as pd
+    import numpy as np
+
+    BASE_COLS = ["PR/PO", "PR/PO Name", "Line Status", "Period", "Line Total"]
+
+    def _ensure_base_cols_exist(df):
+        for col in BASE_COLS:
+            if col not in df.columns:
+                df[col] = np.nan
+        return df
+
+    def _reorder_cols_end_before_mapping(df):
+        """
+        Put BASE_COLS as a block at the very end, immediately before 'Mapping'.
+        If 'Mapping' exists, move it to be the last column.
+        If not, just place BASE_COLS at the end.
+        """
+        df = _ensure_base_cols_exist(df)
+        cols = list(df.columns)
+
+        has_mapping = "Mapping" in cols
+        cols_wo_base = [c for c in cols if c not in BASE_COLS]
+        if has_mapping:
+            cols_wo_base_mapping = [c for c in cols_wo_base if c != "Mapping"]
+            new_cols = cols_wo_base_mapping + BASE_COLS + ["Mapping"]
+        else:
+            new_cols = cols_wo_base + BASE_COLS
+
+        return df.reindex(columns=new_cols)
+
+    # Read raw
+    df_prelim = pd.read_excel(file_path, sheet_name=0)
+    initial_len = len(df_prelim)  # SAFETY: guard against row-doubling
+
+    # =========================
+    # Base enrichments
+    # =========================
+    df_prelim['Country'] = df_prelim['Company Code'].astype(str).str[:2]
+
+    df_prelim = pd.merge(
+        df_prelim,
+        df_ent[['Entity Code', 'Entity Name', 'Business Segment']],
+        how='left', left_on='Company Code', right_on='Entity Code'
+    )
+    df_prelim.drop(columns=['Entity Code'], inplace=True)
+    df_prelim.rename(columns={'Entity Name': 'Entity Name_y',
+                              'Business Segment': 'Biz Segment'}, inplace=True)
+
+    df_prelim['Posting Date']  = pd.to_datetime(df_prelim['Posting Date'],  errors='coerce')
+    df_prelim['Document Date'] = pd.to_datetime(df_prelim['Document Date'], errors='coerce')
+    df_prelim['Month'] = df_prelim['Posting Date'].dt.strftime('%b-%y')
+
+    df_prelim['G/L Account'] = df_prelim['G/L Account'].fillna(0).astype(int)
+    df_coa['gl_l4'] = df_coa['gl_l4'].fillna(0).astype(int)
+
+    df_prelim = pd.merge(
+        df_prelim,
+        df_coa[['gl_l4', 'gl_l1_name', 'gl_l2_name', 'gl_l3_name', 'gl_l4_name']],
+        how='left', left_on='G/L Account', right_on='gl_l4'
+    )
+    df_prelim.drop(columns=['gl_l4'], inplace=True)
+    df_prelim.rename(columns={'gl_l1_name': 'GL L1', 'gl_l2_name': 'GL L2',
+                              'gl_l3_name': 'GL L3', 'gl_l4_name': 'GL L4'}, inplace=True)
+
+    df_prelim['CC'] = df_prelim['Cost Center'].astype(str).str[-6:]
+
+    df_prelim = pd.merge(
+        df_prelim,
+        df_cc[['CC Code L4', 'Type', 'Cost Center L1', 'Cost Center L2',
+               'Cost Center L3', 'Cost Center L4', 'Used By']],
+        how='left', left_on='CC', right_on='CC Code L4'
+    )
+    df_prelim.drop(columns=['CC Code L4'], inplace=True)
+    df_prelim.rename(columns={'Type': 'Product/Function', 'Cost Center L1': 'CC Lv1',
+                              'Cost Center L2': 'CC Lv2', 'Cost Center L3': 'CC Lv3',
+                              'Cost Center L4': 'CC Lv4', 'Used By': 'Used By'}, inplace=True)
+
+    df_cash['GL_Accounts2'] = df_cash['GL_Accounts2'].astype(int)
+    df_prelim = pd.merge(
+        df_prelim,
+        df_cash[['GL_Accounts2', 'Topology_0']],
+        how='left', left_on='G/L Account', right_on='GL_Accounts2'
+    )
+    df_prelim.drop(columns=['GL_Accounts2'], inplace=True)
+    df_prelim.rename(columns={'Topology_0': 'Cash Opex'}, inplace=True)
+
+    # RNS mapping
+    rns_mapping_dict = {
+        'D4AO01': 'Driver Strategy', 'SOCT01': 'Driver Strategy',
+        'D4CT01': 'Driver Swadaya', 'D4IN01': 'Driver Swadaya',
+        'DCSW01': 'Driver Swadaya', 'DSQT01': 'Driver Training',
+        'LEGL01': 'Legal', 'REGJ02': 'Region CWJ', 'REGJ04': 'Region EJBN',
+        'REGE01': 'Region EM', 'REGS01': 'Region EM',
+        'REGJ01': 'Region Jabo', 'REGJ05': 'Region Jabo',
+        'DCOL02': 'Region Operation', 'D4EX01': 'Region Operation', 'REDO01': 'Region Operation',
+        'RGST01': 'Region Strategy', 'SCIT01': 'SPI', 'CRCT01': 'SPI',
+        'RGME01': 'User Growth', 'AMDV01': 'Warehouse & Distribution'
+    }
+    df_prelim['RNS Mapping'] = df_prelim['CC'].map(rns_mapping_dict)
+
+    # =========================
+    # PR/PO build + initial classify (+ normalize weird POs)
+    # =========================
+    df_prelim['PR/PO'] = df_prelim['Purchasing Document'].fillna(df_prelim['Reference'])
+    prpo_init = df_prelim['PR/PO'].astype(str).str.strip()
+
+    # Normalize "ID########/anything" or "ID########-anything" -> "ID########"
+    prpo_init = prpo_init.str.replace(r'^(ID\d{8})[\/\-].*$', r'\1', regex=True)
+
+    is_po_init = prpo_init.str.fullmatch(r'ID\d{8}')   # PO: "ID" + 8 digits
+    is_pr_init = prpo_init.str.fullmatch(r'\d{5}')     # PR: exactly 5 digits
+
+    # =========================
+    # Replace PR -> PO BEFORE lookup (no row doubling)
+    # =========================
+    df_req_map = (
+        df_req[['Req #', 'PO Number']]
+        .dropna(subset=['Req #'])
+        .drop_duplicates(subset=['Req #'])
+        .rename(columns={'Req #': 'PR_Number', 'PO Number': 'PO_Number'})
+    )
+    df_prelim = df_prelim.merge(
+        df_req_map,
+        how='left',
+        left_on=prpo_init.where(is_pr_init),
+        right_on='PR_Number'
+    )
+    df_prelim['PR/PO'] = np.where(
+        is_pr_init & df_prelim['PO_Number'].notna(),
+        df_prelim['PO_Number'],
+        prpo_init
+    )
+    df_prelim.drop(columns=['PR_Number', 'PO_Number'], inplace=True, errors='ignore')
+
+    # Re-normalize after replacement (if the mapped PO had suffixes)
+    df_prelim['PR/PO'] = df_prelim['PR/PO'].astype(str).str.strip() \
+        .str.replace(r'^(ID\d{8})[\/\-].*$', r'\1', regex=True)
+
+    # Effective classification after replacement
+    prpo_eff = df_prelim['PR/PO'].astype(str).str.strip()
+    df_prelim['is_po'] = prpo_eff.str.fullmatch(r'ID\d{8}')
+    df_prelim['is_pr'] = prpo_eff.str.fullmatch(r'\d{5}')
+
+    # =========================
+    # Exact line-matching keys (odd → normal mapping)
+    # =========================
+    prelim_item_num = pd.to_numeric(df_prelim['Item'], errors='coerce')
+    df_prelim['lookup_line'] = np.where(prelim_item_num.notna(),
+                                        ((prelim_item_num.astype('Int64') + 1) // 2),
+                                        pd.NA)
+
+    df_prelim['PR_key'] = prpo_eff.where(df_prelim['is_pr']).astype('string')
+    df_prelim['PO_key'] = prpo_eff.where(df_prelim['is_po']).astype('string')
+
+    df_prelim['PR_match_key'] = np.where(
+        df_prelim['is_pr'],
+        df_prelim['PR_key'].fillna('').str.strip() + '|' + df_prelim['lookup_line'].astype('Int64').astype(str),
+        ''
+    )
+    df_prelim['PO_match_key'] = np.where(
+        df_prelim['is_po'],
+        df_prelim['PO_key'].fillna('').str.strip() + '|' + df_prelim['lookup_line'].astype('Int64').astype(str),
+        ''
+    )
+
+    # =========================
+    # Build lookup dicts (no row doubling)
+    # =========================
+    # Layer 1 maps: exact line
+    _req = df_req.copy()
+    _req['Req #']      = _req['Req #'].astype(str).str.strip()
+    _req['Req Line #'] = pd.to_numeric(_req['Req Line #'], errors='coerce').astype('Int64')
+    _req['Item']       = _req['Item'].astype(str).str.strip()
+    _req = _req.dropna(subset=['Req Line #'])
+    _req['req_key']    = _req['Req #'] + '|' + _req['Req Line #'].astype(str)
+    req_item_map = _req.set_index('req_key')['Item'].to_dict()
+
+    _order = df_order.copy()
+    _order['PO Number (Header)'] = _order['PO Number (Header)'].astype(str).str.strip()
+    _order['Line']               = pd.to_numeric(_order['Line'], errors='coerce').astype('Int64')
+    _order['Item']               = _order['Item'].astype(str).str.strip()
+    _order = _order.dropna(subset=['Line'])
+    _order['order_key']          = _order['PO Number (Header)'] + '|' + _order['Line'].astype(str)
+    order_item_map = _order.set_index('order_key')['Item'].to_dict()
+
+    # Layer 2 maps: first Item per PR/PO
+    req_first_item_map = (
+        _req.sort_values(['Req #', 'Req Line #'])
+            .groupby('Req #', sort=False)['Item']
+            .first()
+            .to_dict()
+    )
+    order_first_item_map = (
+        _order.sort_values(['PO Number (Header)', 'Line'])
+              .groupby('PO Number (Header)', sort=False)['Item']
+              .first()
+              .to_dict()
+    )
+
+    # =========================
+    # Fill PR/PO Name (Layer 1 then Layer 2)
+    # =========================
+    df_prelim['PR/PO Name'] = ''
+    before_fill_blank = df_prelim['PR/PO Name'].eq('').sum()
+
+    # Layer 1: exact line match
+    mask_pr_l1 = df_prelim['is_pr'] & df_prelim['lookup_line'].notna()
+    if mask_pr_l1.any():
+        df_prelim.loc[mask_pr_l1, 'PR/PO Name'] = (
+            df_prelim.loc[mask_pr_l1, 'PR_match_key'].map(req_item_map).fillna('')
+        )
+
+    mask_po_l1 = df_prelim['is_po'] & df_prelim['lookup_line'].notna()
+    if mask_po_l1.any():
+        df_prelim.loc[mask_po_l1, 'PR/PO Name'] = (
+            df_prelim.loc[mask_po_l1, 'PO_match_key'].map(order_item_map).fillna('')
+        )
+
+    after_l1_blank_mask = df_prelim['PR/PO Name'].astype(str).str.strip().eq('')
+    layer1_name_fills = before_fill_blank - after_l1_blank_mask.sum()
+
+    # Layer 2: if still blank, take first Item per PR/PO
+    pr_blank = after_l1_blank_mask & df_prelim['is_pr']
+    if pr_blank.any():
+        df_prelim.loc[pr_blank, 'PR/PO Name'] = (
+            df_prelim.loc[pr_blank, 'PR_key'].astype(str).str.strip().map(req_first_item_map).fillna('')
+        )
+
+    po_blank = after_l1_blank_mask & df_prelim['is_po']
+    if po_blank.any():
+        df_prelim.loc[po_blank, 'PR/PO Name'] = (
+            df_prelim.loc[po_blank, 'PO_key'].astype(str).str.strip().map(order_first_item_map).fillna('')
+        )
+
+    after_l2_blank_mask = df_prelim['PR/PO Name'].astype(str).str.strip().eq('')
+    layer2_name_fills = after_l1_blank_mask.sum() - after_l2_blank_mask.sum()
+
+    # Non PR/PO rows -> fallback to Text
+    other_blank = after_l2_blank_mask & ~(df_prelim['is_pr'] | df_prelim['is_po'])
+    if other_blank.any():
+        df_prelim.loc[other_blank, 'PR/PO Name'] = df_prelim.loc[other_blank, 'Text'].fillna('')
+
+    final_blank_mask = df_prelim['PR/PO Name'].astype(str).str.strip().eq('')
+    text_name_fills = other_blank.sum()
+    remaining_name_blanks = final_blank_mask.sum()
+
+    # =========================
+    # Fill Line Status / Period / Line Total (no row doubling)
+    # =========================
+    for col in ['Line Status', 'Period', 'Line Total']:
+        if col not in df_prelim.columns:
+            df_prelim[col] = np.nan
+
+    # Line-level maps (Layer 1)
+    req_status_line_map = _req.set_index('req_key')['Status (Header)'].to_dict() if 'Status (Header)' in _req.columns else {}
+    req_period_line_map = _req.set_index('req_key')['Period'].to_dict()             if 'Period' in _req.columns else {}
+    req_total_line_map  = _req.set_index('req_key')['Line Total'].to_dict()         if 'Line Total' in _req.columns else {}
+
+    order_status_line_map = _order.set_index('order_key')['Line Status'].to_dict()  if 'Line Status' in _order.columns else {}
+    order_period_line_map = _order.set_index('order_key')['Period'].to_dict()       if 'Period' in _order.columns else {}
+    order_total_line_map  = _order.set_index('order_key')['Line Total'].to_dict()   if 'Line Total' in _order.columns else {}
+
+    # First-line-per-PR/PO maps (Layer 2)
+    req_first_status_map = (_req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Status (Header)'].first().to_dict()) if 'Status (Header)' in _req.columns else {}
+    req_first_period_map = (_req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Period'].first().to_dict()) if 'Period' in _req.columns else {}
+    req_first_total_map  = (_req.sort_values(['Req #', 'Req Line #']).groupby('Req #', sort=False)['Line Total'].first().to_dict()) if 'Line Total' in _req.columns else {}
+
+    order_first_status_map = (_order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Line Status'].first().to_dict()) if 'Line Status' in _order.columns else {}
+    order_first_period_map = (_order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Period'].first().to_dict()) if 'Period' in _order.columns else {}
+    order_first_total_map  = (_order.sort_values(['PO Number (Header)', 'Line']).groupby('PO Number (Header)', sort=False)['Line Total'].first().to_dict()) if 'Line Total' in _order.columns else {}
+
+    # Helpers
+    def _is_blank(s):
+        if pd.api.types.is_numeric_dtype(s):
+            return s.isna()
+        return s.isna() | (s.astype(str).str.strip() == '')
+
+    # Track diagnostics
+    l1_status_fills = l2_status_fills = l1_period_fills = l2_period_fills = l1_total_fills = l2_total_fills = 0
+
+    # LAYER 1 (exact line)
+    if mask_pr_l1.any():
+        keys = df_prelim.loc[mask_pr_l1, 'PR_match_key']
+        if req_status_line_map:
+            before = _is_blank(df_prelim.loc[mask_pr_l1, 'Line Status']).sum()
+            df_prelim.loc[mask_pr_l1 & _is_blank(df_prelim['Line Status']), 'Line Status'] = keys.map(req_status_line_map)
+            l1_status_fills += before - _is_blank(df_prelim.loc[mask_pr_l1, 'Line Status']).sum()
+        if req_period_line_map:
+            before = _is_blank(df_prelim.loc[mask_pr_l1, 'Period']).sum()
+            df_prelim.loc[mask_pr_l1 & _is_blank(df_prelim['Period']), 'Period'] = keys.map(req_period_line_map)
+            l1_period_fills += before - _is_blank(df_prelim.loc[mask_pr_l1, 'Period']).sum()
+        if req_total_line_map:
+            before = _is_blank(df_prelim.loc[mask_pr_l1, 'Line Total']).sum()
+            df_prelim.loc[mask_pr_l1 & _is_blank(df_prelim['Line Total']), 'Line Total'] = keys.map(req_total_line_map)
+            l1_total_fills += before - _is_blank(df_prelim.loc[mask_pr_l1, 'Line Total']).sum()
+
+    if mask_po_l1.any():
+        keys = df_prelim.loc[mask_po_l1, 'PO_match_key']
+        if order_status_line_map:
+            before = _is_blank(df_prelim.loc[mask_po_l1, 'Line Status']).sum()
+            df_prelim.loc[mask_po_l1 & _is_blank(df_prelim['Line Status']), 'Line Status'] = keys.map(order_status_line_map)
+            l1_status_fills += before - _is_blank(df_prelim.loc[mask_po_l1, 'Line Status']).sum()
+        if order_period_line_map:
+            before = _is_blank(df_prelim.loc[mask_po_l1, 'Period']).sum()
+            df_prelim.loc[mask_po_l1 & _is_blank(df_prelim['Period']), 'Period'] = keys.map(order_period_line_map)
+            l1_period_fills += before - _is_blank(df_prelim.loc[mask_po_l1, 'Period']).sum()
+        if order_total_line_map:
+            before = _is_blank(df_prelim.loc[mask_po_l1, 'Line Total']).sum()
+            df_prelim.loc[mask_po_l1 & _is_blank(df_prelim['Line Total']), 'Line Total'] = keys.map(order_total_line_map)
+            l1_total_fills += before - _is_blank(df_prelim.loc[mask_po_l1, 'Line Total']).sum()
+
+    # LAYER 2 (first line per PR/PO)
+    pr_mask = df_prelim['is_pr']
+    po_mask = df_prelim['is_po']
+
+    if req_first_status_map:
+        before = _is_blank(df_prelim.loc[pr_mask, 'Line Status']).sum()
+        df_prelim.loc[pr_mask & _is_blank(df_prelim['Line Status']), 'Line Status'] = (
+            df_prelim.loc[pr_mask, 'PR_key'].astype(str).str.strip().map(req_first_status_map)
+        )
+        l2_status_fills += before - _is_blank(df_prelim.loc[pr_mask, 'Line Status']).sum()
+    if order_first_status_map:
+        before = _is_blank(df_prelim.loc[po_mask, 'Line Status']).sum()
+        df_prelim.loc[po_mask & _is_blank(df_prelim['Line Status']), 'Line Status'] = (
+            df_prelim.loc[po_mask, 'PO_key'].astype(str).str.strip().map(order_first_status_map)
+        )
+        l2_status_fills += before - _is_blank(df_prelim.loc[po_mask, 'Line Status']).sum()
+
+    if req_first_period_map:
+        before = _is_blank(df_prelim.loc[pr_mask, 'Period']).sum()
+        df_prelim.loc[pr_mask & _is_blank(df_prelim['Period']), 'Period'] = (
+            df_prelim.loc[pr_mask, 'PR_key'].astype(str).str.strip().map(req_first_period_map)
+        )
+        l2_period_fills += before - _is_blank(df_prelim.loc[pr_mask, 'Period']).sum()
+    if order_first_period_map:
+        before = _is_blank(df_prelim.loc[po_mask, 'Period']).sum()
+        df_prelim.loc[po_mask & _is_blank(df_prelim['Period']), 'Period'] = (
+            df_prelim.loc[po_mask, 'PO_key'].astype(str).str.strip().map(order_first_period_map)
+        )
+        l2_period_fills += before - _is_blank(df_prelim.loc[po_mask, 'Period']).sum()
+
+    if req_first_total_map:
+        before = _is_blank(df_prelim.loc[pr_mask, 'Line Total']).sum()
+        df_prelim.loc[pr_mask & _is_blank(df_prelim['Line Total']), 'Line Total'] = (
+            df_prelim.loc[pr_mask, 'PR_key'].astype(str).str.strip().map(req_first_total_map)
+        )
+        l2_total_fills += before - _is_blank(df_prelim.loc[pr_mask, 'Line Total']).sum()
+    if order_first_total_map:
+        before = _is_blank(df_prelim.loc[po_mask, 'Line Total']).sum()
+        df_prelim.loc[po_mask & _is_blank(df_prelim['Line Total']), 'Line Total'] = (
+            df_prelim.loc[po_mask, 'PO_key'].astype(str).str.strip().map(order_first_total_map)
+        )
+        l2_total_fills += before - _is_blank(df_prelim.loc[po_mask, 'Line Total']).sum()
+
+    # Optional: cast Line Total numeric if it's numeric-like
+    try:
+        df_prelim['Line Total'] = pd.to_numeric(df_prelim['Line Total'])
+    except Exception:
+        pass
+
+    # =========================
+    # Keyword mapping fallbacks
+    # =========================
+    if 'Period' not in df_prelim:      df_prelim['Period'] = ''
+    if 'Line Total' not in df_prelim:  df_prelim['Line Total'] = ''
+    if 'Line Status' not in df_prelim: df_prelim['Line Status'] = ''
+
+    conditions_1 = [
+        df_prelim['PR/PO Name'].str.contains('Hurricane', na=False, case=False),
+        df_prelim['PR/PO Name'].str.contains('Tier 3',    na=False, case=False),
+        df_prelim['PR/PO Name'].str.contains('Solo Domination', na=False, case=False),
+        df_prelim['PR/PO Name'].str.contains('Makan Bergizi',   na=False, case=False),
+        df_prelim['PR/PO Name'].str.contains(r'\[Ops\]', na=False, case=False),
+        df_prelim['PR/PO Name'].str.contains(r'\[CE\]',  na=False, case=False),
+        df_prelim['PR/PO Name'].str.contains(r'\[UG\]',  na=False, case=False),
+        df_prelim['PR/PO Name'].str.contains('DB-',      na=False, case=False),
+    ]
+    choices_1 = ['Hurricane', 'T3', 'Solo Domination', 'Orang Tua Asuh', 'OPS', 'UG', 'UG', 'Debit Card']
+    df_prelim['PR/PO Keyword Mapping'] = np.select(conditions_1, choices_1, default='')
+
+    mask_2 = df_prelim['PR/PO Keyword Mapping'] == ''
+    text_sub = df_prelim.loc[mask_2, 'Text']
+    df_prelim.loc[mask_2, 'PR/PO Keyword Mapping'] = np.select(
+        [
+            text_sub.str.contains('VOUCHER CASHBACK REGIONAL', na=False, case=False),
+            text_sub.str.contains('Bonus Incentives',           na=False, case=False),
+            text_sub.str.contains('DB-',                         na=False, case=False),
+        ],
+        ['Voucher Swadaya', 'Bonus Incentives', 'Debit Card'],
+        default=''
+    )
+
+    mask_3 = df_prelim['PR/PO Keyword Mapping'] == ''
+    gl4_sub = df_prelim.loc[mask_3, 'GL L4']
+    df_prelim.loc[mask_3, 'PR/PO Keyword Mapping'] = np.select(
+        [
+            gl4_sub.str.contains("A&M - CENTRALIZED MARKETING - NON PRODUCT",           na=False, case=False),
+            gl4_sub.str.contains("CONTRACTED SERVICES - MONTHLY WORKERS",               na=False, case=False),
+            gl4_sub.str.contains("CONTRACTED SERVICES - INTERN STIPENDS",               na=False, case=False),
+            gl4_sub.str.contains("OTHER NON-VARIABLE - OTHERS - SOCIAL DEVELOPMENT",    na=False, case=False),
+            gl4_sub.str.contains("OTHER NON-VARIABLE - OTHERS -INTCO- SOCIAL DVLPMNT",  na=False, case=False),
+            gl4_sub.str.contains("OPS - DRIVERS - APPRECIATION",                        na=False, case=False),
+            gl4_sub.str.contains("OPS - DELIVERY AND COURIER",                           na=False, case=False),
+            gl4_sub.str.contains("CONTRACTED SERVICES - BPO",                            na=False, case=False),
+            gl4_sub.str.contains("CONTRACTED SERVICES - DAILY WORKERS",                  na=False, case=False),
+            gl4_sub.str.contains("OPS - DRIVERS - DRIVERS'S EQUIPMENTS",                 na=False, case=False),
+            gl4_sub.str.contains("OTHER NON-VARIABLE - STATIONERIES",                    na=False, case=False),
+            gl4_sub.str.contains("OTHER NON-VARIABLE - OTHERS - PHOTOCOPY & PRINTING",   na=False, case=False),
+            gl4_sub.str.contains("OTHER NON-VARIABLE - COMM - DATA & INTERNET",          na=False, case=False),
+        ],
+        ["UG", "MPO", "Intern", "Orang Tua Asuh", "Orang Tua Asuh",
+         "OPS", "OPS", "OPS", "OPS", "OPS", "OPS", "OPS", "Hurricane"],
+        default=''
+    )
+
+    mask_4 = df_prelim['PR/PO Keyword Mapping'] == ''
+    period_sub = df_prelim.loc[mask_4, 'Period'].astype(str)
+    df_prelim.loc[mask_4, 'PR/PO Keyword Mapping'] = np.select(
+        [period_sub.str.contains("2023", na=False), period_sub.str.contains("2022", na=False)],
+        ["2023", "2022"],
+        default=''
+    )
+
+    mask_5 = df_prelim['PR/PO Keyword Mapping'] == ''
+    gl2_sub = df_prelim.loc[mask_5, 'GL L2'].astype(str)
+    df_prelim.loc[mask_5, 'PR/PO Keyword Mapping'] = np.select(
+        [
+            gl2_sub.str.contains("TME \\(L2\\)",                           na=False, case=False),
+            gl2_sub.str.contains("Rent and Office Related Costs \\(L2\\)",  na=False, case=False),
+        ],
+        ["TME", "Rent"],
+        default=''
+    )
+
+    # Rename to requested final name
+    if 'PR/PO Keyword Mapping' in df_prelim.columns:
+        df_prelim.rename(columns={'PR/PO Keyword Mapping': 'Mapping'}, inplace=True)
+
+    # =========================
+    # Filters
+    # =========================
+    df_prelim = df_prelim[df_prelim['Country'] == 'ID']
+    df_prelim = df_prelim[df_prelim['GL L2'] != 'Personnel Costs (L2)']
+    df_prelim = df_prelim.dropna(subset=['RNS Mapping'])
+
+    # =========================
+    # SAFETY + DIAGNOSTICS (computed BEFORE helper-column cleanup)
+    # =========================
+    final_len = len(df_prelim)
+    diagnostics = {
+        'rows_initial': int(initial_len),
+        'rows_final': int(final_len),
+        'row_count_unchanged': bool(final_len == initial_len),
+        'name_layer1_fills': int(layer1_name_fills),
+        'name_layer2_fills': int(layer2_name_fills),
+        'name_text_fallback_fills': int(text_name_fills),
+        'name_remaining_blank': int(remaining_name_blanks),
+        'line_status_layer1_fills': int(l1_status_fills),
+        'line_status_layer2_fills': int(l2_status_fills),
+        'period_layer1_fills': int(l1_period_fills),
+        'period_layer2_fills': int(l2_period_fills),
+        'line_total_layer1_fills': int(l1_total_fills),
+        'line_total_layer2_fills': int(l2_total_fills),
+        'is_po_count': int(df_prelim['is_po'].sum()),
+        'is_pr_count': int(df_prelim['is_pr'].sum()),
+    }
+
+    # =========================
+    # FINAL CLEANUP (drop helper/split columns)
+    # =========================
+    cols_to_drop = [
+        'region','tier','city','budget','activity','campaign','type_activity','period',
+        'is_po','is_pr','lookup_line','PR_key','PO_key','PR_match_key','PO_match_key'
+    ]
+    drop_existing = [c for c in cols_to_drop if c in df_prelim.columns]
+    if drop_existing:
+        df_prelim.drop(columns=drop_existing, inplace=True)
+
+    # =========================
+    # Sheet segmentation (on cleaned df_prelim)
+    # - Exclude Mapping == "TME" from Driver Team
+    # - Drop Mapping for SPI, User Growth, Region Strategy, Warehouse & Distribution
+    # - Column order: base cols at END, before Mapping (if present)
+    # =========================
+    driver_team_categories = ['Driver Strategy', 'Driver Swadaya', 'Driver Training', 'Region Operation']
+    rns_sheets = {}
+
+    # Driver Team
+    df_driver_team = df_prelim[df_prelim['RNS Mapping'].isin(driver_team_categories)].copy()
+    if 'Mapping' in df_driver_team.columns:
+        df_driver_team = df_driver_team[df_driver_team['Mapping'] != 'TME']
+        # drop Mapping column for Driver Team
+        df_driver_team.drop(columns=['Mapping'], inplace=True)
+    df_driver_team = _reorder_cols_end_before_mapping(df_driver_team)
+    if not df_driver_team.empty:
+        rns_sheets['Driver Team'] = df_driver_team
+
+    # Other RNS sheets; drop Mapping for specific ones
+    drop_mapping_for = {'SPI', 'User Growth', 'Region Strategy', 'Warehouse & Distribution'}
+    for rns in df_prelim['RNS Mapping'].unique():
+        if rns not in driver_team_categories:
+            df_sheet = df_prelim[df_prelim['RNS Mapping'] == rns].copy()
+            if rns in drop_mapping_for and 'Mapping' in df_sheet.columns:
+                df_sheet.drop(columns=['Mapping'], inplace=True)
+            df_sheet = _reorder_cols_end_before_mapping(df_sheet)
+            rns_sheets[rns] = df_sheet
+
+    if return_diagnostics:
+        return rns_sheets, diagnostics
+    return rns_sheets
+
+
+# ================================================================
+# Batch processing + consolidation
+# ================================================================
+input_dir = '/content/gdrive/Shareddrives/Gojek FP&A Central Drive/81. Others/automation/streamlining_region&salestracker/input/'
+output_dir = '/content/gdrive/Shareddrives/Gojek FP&A Central Drive/81. Others/automation/streamlining_region&salestracker/output/'
+consolidated_file_path = os.path.join(output_dir, 'consolidated.xlsx')
+
+# Process and save individual files
+for file_name in os.listdir(input_dir):
+    if file_name.upper().endswith('.XLSX'):
+        file_path = os.path.join(input_dir, file_name)
+        rns_sheets = process_prelim_file(file_path)
+        output_file_path = os.path.join(output_dir, f'processed_{file_name.lower()}')
+
+        with pd.ExcelWriter(output_file_path, engine='openpyxl') as writer:
+            if rns_sheets:
+                for rns_name, df_rns in rns_sheets.items():
+                    df_rns.to_excel(writer, sheet_name=rns_name, index=False)
+            else:
+                pd.DataFrame({'No Data': ['No matching RNS Mapping found']}).to_excel(writer, sheet_name='Empty', index=False)
+
+# Consolidate sheets
+consolidated_sheets = {}
+for file_name in os.listdir(output_dir):
+    if file_name.startswith('processed_') and file_name.endswith('.xlsx'):
+        file_path = os.path.join(output_dir, file_name)
+        xls = pd.ExcelFile(file_path)
+        for sheet_name in xls.sheet_names:
+            if sheet_name != 'Empty':  # Skip empty sheets
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                # Optional: enforce end-before-mapping order here too
+                # df = _reorder_cols_end_before_mapping(df)
+                if sheet_name in consolidated_sheets:
+                    consolidated_sheets[sheet_name] = pd.concat([consolidated_sheets[sheet_name], df], ignore_index=True)
+                else:
+                    consolidated_sheets[sheet_name] = df
+
+# Save consolidated data
+with pd.ExcelWriter(consolidated_file_path, engine='openpyxl') as writer:
+    for sheet_name, df in consolidated_sheets.items():
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+print(f"Consolidated file saved as: {consolidated_file_path}")
